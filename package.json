@@ -1,0 +1,9 @@
+{
+  "name": "mahnoor-temp-hvac",
+  "version": "1.0.0",
+  "description": "HVAC IoT pipeline — mahnoor-temp resources",
+  "devDependencies": {
+    "serverless": "^3.38.0",
+    "serverless-python-requirements": "^6.1.0"
+  }
+}

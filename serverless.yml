@@ -1,0 +1,276 @@
+service: mahnoor-temp-hvac-new
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-2
+  stage: ${opt:stage, 'dev'}
+
+  environment:
+    DYNAMODB_TABLE: mahnoor-temp-hvac-table
+    SQS_QUEUE_URL: !Ref mahnoorTempHvacQueue
+    IOT_TOPIC: mahnoor-temp/hvac/data
+    STAGE: ${self:provider.stage}
+
+  iam:
+    role:
+      name: mahnoor-temp-hvac-lambda-role
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:Scan
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+          Resource:
+            - !GetAtt mahnoorTempHvacTable.Arn
+            - !Sub "${mahnoorTempHvacTable.Arn}/index/*"
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt mahnoorTempHvacQueue.Arn
+        - Effect: Allow
+          Action:
+            - iot:Publish
+            - iot:Subscribe
+            - iot:Connect
+            - iot:Receive
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - lambda:InvokeFunction
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: "*"
+
+functions:
+  # Lambda 1: Triggered by SQS, saves HVAC data to DynamoDB
+  mahnoorTempIngestHvac:
+    name: mahnoor-temp-ingest-hvac
+    handler: ingest_hvac.handler
+    description: "Receives HVAC data from SQS and saves to DynamoDB"
+    timeout: 30
+    memorySize: 256
+    events:
+      - sqs:
+          arn: !GetAtt mahnoorTempHvacQueue.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+    environment:
+      PROCESSOR_LAMBDA_NAME: mahnoor-temp-process-hvac
+
+  # Lambda 2: Triggered after DynamoDB save, processes/alerts
+  mahnoorTempProcessHvac:
+    name: mahnoor-temp-process-hvac
+    handler: process_hvac.handler
+    description: "Processes saved HVAC data, triggers alerts if needed"
+    timeout: 30
+    memorySize: 256
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt mahnoorTempHvacTable.StreamArn
+          startingPosition: LATEST
+          batchSize: 10
+          filterPatterns:
+            - eventName: [INSERT, MODIFY]
+
+  # Lambda 3: API Gateway backed Lambda for dashboard
+  mahnoorTempDashboardApi:
+    name: mahnoor-temp-dashboard-api
+    handler: dashboard_api.handler
+    description: "REST API for HVAC dashboard"
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /hvac
+          method: get
+          cors: true
+      - http:
+          path: /hvac/{deviceId}
+          method: get
+          cors: true
+      - http:
+          path: /hvac/stats
+          method: get
+          cors: true
+      - http:
+          path: /hvac/latest
+          method: get
+          cors: true
+
+resources:
+  Resources:
+    # ─────────────────────────────────────────
+    # SQS Queue (with Dead Letter Queue)
+    # ─────────────────────────────────────────
+    mahnoorTempHvacDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: mahnoor-temp-hvac-dlq
+        MessageRetentionPeriod: 1209600  # 14 days
+        Tags:
+          - Key: Project
+            Value: mahnoor-temp
+          - Key: Component
+            Value: hvac-pipeline
+
+    mahnoorTempHvacQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: mahnoor-temp-hvac-queue
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 86400  # 1 day
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt mahnoorTempHvacDLQ.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Project
+            Value: mahnoor-temp
+          - Key: Component
+            Value: hvac-pipeline
+
+    # ─────────────────────────────────────────
+    # SQS Queue Policy (allows IoT to send)
+    # ─────────────────────────────────────────
+    mahnoorTempHvacQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref mahnoorTempHvacQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: iot.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt mahnoorTempHvacQueue.Arn
+
+    # ─────────────────────────────────────────
+    # DynamoDB Table
+    # ─────────────────────────────────────────
+    mahnoorTempHvacTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: mahnoor-temp-hvac-table
+        BillingMode: PAY_PER_REQUEST
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        AttributeDefinitions:
+          - AttributeName: deviceId
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+        KeySchema:
+          - AttributeName: deviceId
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: mahnoor-temp-timestamp-index
+            KeySchema:
+              - AttributeName: timestamp
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        Tags:
+          - Key: Project
+            Value: mahnoor-temp
+          - Key: Component
+            Value: hvac-pipeline
+
+    # ─────────────────────────────────────────
+    # IoT Rule → SQS
+    # ─────────────────────────────────────────
+    mahnoorTempIotRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: mahnoor-temp-iot-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: iot.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: mahnoor-temp-iot-sqs-policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: sqs:SendMessage
+                  Resource: !GetAtt mahnoorTempHvacQueue.Arn
+
+    mahnoorTempIotRule:
+      Type: AWS::IoT::TopicRule
+      Properties:
+        RuleName: mahnoor_temp_hvac_rule
+        TopicRulePayload:
+          Description: "Routes HVAC sensor data from IoT to SQS"
+          Sql: "SELECT * FROM 'mahnoor-temp/hvac/data'"
+          RuleDisabled: false
+          Actions:
+            - Sqs:
+                QueueUrl: !Ref mahnoorTempHvacQueue
+                RoleArn: !GetAtt mahnoorTempIotRole.Arn
+                UseBase64: false
+
+  Outputs:
+    IoTTopicName:
+      Description: "Publish HVAC data to this IoT topic"
+      Value: "mahnoor-temp/hvac/data"
+
+    SQSQueueUrl:
+      Description: "SQS Queue URL"
+      Value: !Ref mahnoorTempHvacQueue
+
+    SQSQueueArn:
+      Description: "SQS Queue ARN"
+      Value: !GetAtt mahnoorTempHvacQueue.Arn
+
+    DynamoDBTableName:
+      Description: "DynamoDB Table Name"
+      Value: !Ref mahnoorTempHvacTable
+
+    ApiGatewayUrl:
+      Description: "Dashboard API Base URL"
+      Value:
+        Fn::Sub: "https://${ApiGatewayRestApi}.execute-api.us-east-2.amazonaws.com/${self:provider.stage}"
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  pythonRequirements:
+    dockerizePip: true
+    slim: true
+package:
+  individually: false
+  patterns:
+    - '!**'
+    - 'ingest_hvac.py'
+    - 'process_hvac.py'
+    - 'dashboard_api.py'
+    - '!venv/**'
+    - '!.venv/**'
+    - '!node_modules/**'
+    - '!functions/**'
+    - '!__pycache__/**'
+    - '!.serverless/**'
