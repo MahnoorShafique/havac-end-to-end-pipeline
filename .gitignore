@@ -17,3 +17,12 @@ node_modules/
 .env
 .vscode/
 .DS_Store
+
+# MQTT.fx / IoT certificates (never commit private keys!)
+*.pem
+*.key
+*.csr
+amazon-root-ca.pem
+mqttfx-cert.pem
+mqttfx-private.key
+mqttfx-csr.csr
