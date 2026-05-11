@@ -16,6 +16,7 @@
 9. [Deployment & Commands](#deployment--commands)
 10. [Errors & Fixes](#errors--fixes)
 11. [Real Device vs Simulated Device](#real-device-vs-simulated-device)
+12. [MQTT.fx Monitoring](#mqttfx-monitoring)
 
 ---
 
@@ -459,6 +460,127 @@ client.publish("mahnoor-temp/hvac/data", json.dumps(data))
 | X.509 certificates | Physical IoT devices | cert + key files on device |
 | Custom authorizer | Web/mobile apps | Lambda-based auth |
 | Cognito | Mobile apps | User pool tokens |
+
+---
+
+## MQTT.fx Monitoring
+
+**Date added:** May 11, 2026
+
+MQTT.fx (or MQTTX) is a desktop GUI client that subscribes to your IoT topic and shows live sensor messages as they arrive — without touching the pipeline.
+
+### Why a separate Thing + Certificate?
+
+Your `hvac_publisher.py` uses **boto3 + IAM credentials** (HTTPS). MQTT.fx speaks the **MQTT protocol over port 8883** and requires X.509 certificate authentication. AWS IoT Core demands three linked resources for any MQTT client:
+
+```
+IoT Thing  ←──  X.509 Certificate  ──→  IoT Policy
+(identity)       (proves identity)        (permissions)
+```
+
+### What was added to `serverless.yml`
+
+| Resource | CloudFormation Type | Purpose |
+|---|---|---|
+| `mahnoorMqttFxThing` | `AWS::IoT::Thing` | Registers MQTT.fx as a named device |
+| `mahnoorMqttFxPolicy` | `AWS::IoT::Policy` | Allows connect/subscribe/receive/publish on `mahnoor-temp/*` |
+| `mahnoorMqttFxCertificate` | `Custom::IoTCertificate` | Runs provisioner Lambda to create cert + attach everything |
+| `mahnoorMqttFxProvisioner` | Lambda function | Custom Resource handler — creates cert, stores keys in SSM |
+
+New IAM permissions were also added to the Lambda role:
+- `iot:CreateKeysAndCertificate`, `iot:AttachPolicy`, `iot:AttachThingPrincipal`, etc.
+- `ssm:PutParameter / GetParameter / DeleteParameter` scoped to `/mahnoor/mqttfx/*`
+
+### How the Custom Resource works
+
+```
+serverless deploy
+      │
+      ▼ CloudFormation sees Custom::IoTCertificate
+      │
+      ▼ Invokes mqttfx_provisioner.handler (RequestType=Create)
+      │
+      ├── iot.create_keys_and_certificate()   → cert PEM + private key
+      ├── iot.attach_policy()                 → links cert → policy
+      ├── iot.attach_thing_principal()        → links cert → thing
+      └── ssm.put_parameter() x4             → stores keys in SSM
+
+serverless remove
+      │
+      ▼ Invokes mqttfx_provisioner.handler (RequestType=Delete)
+      │
+      ├── detach policy + thing from cert
+      ├── deactivate + delete certificate
+      └── delete SSM parameters
+```
+
+### Deploy
+
+```bash
+serverless deploy --region us-east-2
+```
+
+After deploy you'll see two new outputs:
+```
+MqttFxThingName      → mahnoor-mqttfx-monitor
+MqttFxCertificateArn → arn:aws:iot:us-east-2:...:cert/abc123...
+```
+
+### Fetch certificates from SSM
+
+```bash
+# Certificate PEM
+aws ssm get-parameter \
+  --name /mahnoor/mqttfx/certificate-pem \
+  --region us-east-2 \
+  --query Parameter.Value \
+  --output text > mqttfx-cert.pem
+
+# Private key (encrypted SecureString — needs --with-decryption)
+aws ssm get-parameter \
+  --name /mahnoor/mqttfx/private-key \
+  --region us-east-2 \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text > mqttfx-private.key
+
+# Amazon Root CA (one-time download)
+curl -o amazon-root-ca.pem https://www.amazontrust.com/repository/AmazonRootCA1.pem
+
+# Get your IoT endpoint
+aws iot describe-endpoint --endpoint-type iot:Data-ATS --region us-east-2
+```
+
+### Configure MQTT.fx / MQTTX
+
+| Field | Value |
+|---|---|
+| **Broker Address** | `xxxxxx-ats.iot.us-east-2.amazonaws.com` (your endpoint) |
+| **Port** | `8883` |
+| **Client ID** | `mahnoor-mqttfx-monitor` |
+| **CA File** | `amazon-root-ca.pem` |
+| **Client Certificate** | `mqttfx-cert.pem` |
+| **Client Key** | `mqttfx-private.key` |
+| **TLS Version** | `TLSv1.2` |
+
+After connecting, subscribe to:
+```
+mahnoor-temp/hvac/data       # live sensor readings
+mahnoor-temp/#               # all topics under mahnoor-temp
+```
+
+Then run the publisher and watch messages appear in real time:
+```bash
+python3 hvac_publisher.py --interval 5
+```
+
+### Files added/changed
+
+| File | Change |
+|---|---|
+| `serverless.yml` | Added Thing, Policy, Custom Resource, provisioner function, IAM permissions, outputs, package pattern |
+| `mqttfx_provisioner.py` | New — Custom Resource Lambda for cert lifecycle |
+| `.gitignore` | Added `*.pem`, `*.key`, `*.csr` to prevent committing secrets |
 
 ---
 

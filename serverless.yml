@@ -1,4 +1,4 @@
-service: mahnoor-temp-hvac-new
+service: mahnoor-temp-hvac-test-MAY9
 
 frameworkVersion: "3"
 
@@ -16,7 +16,7 @@ provider:
 
   iam:
     role:
-      name: mahnoor-temp-hvac-lambda-role
+      name: mahnoor-temp-hvac-lambda-role-may9
       statements:
         - Effect: Allow
           Action:
@@ -43,6 +43,24 @@ provider:
             - iot:Connect
             - iot:Receive
           Resource: "*"
+        # MQTT.fx provisioner — certificate + attachment permissions
+        - Effect: Allow
+          Action:
+            - iot:CreateKeysAndCertificate
+            - iot:DeleteCertificate
+            - iot:UpdateCertificate
+            - iot:AttachPolicy
+            - iot:DetachPolicy
+            - iot:AttachThingPrincipal
+            - iot:DetachThingPrincipal
+            - iot:DescribeEndpoint
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - ssm:PutParameter
+            - ssm:DeleteParameter
+            - ssm:GetParameter
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/mahnoor/mqttfx/*"
         - Effect: Allow
           Action:
             - lambda:InvokeFunction
@@ -110,6 +128,14 @@ functions:
           path: /hvac/latest
           method: get
           cors: true
+
+  # Lambda 4: Custom Resource — provisions IoT cert for MQTT.fx during deploy
+  mahnoorMqttFxProvisioner:
+    name: mahnoor-mqttfx-provisioner
+    handler: mqttfx_provisioner.handler
+    description: "Custom resource — creates IoT X.509 cert for MQTT.fx, stores keys in SSM"
+    timeout: 60
+    memorySize: 128
 
 resources:
   Resources:
@@ -201,7 +227,7 @@ resources:
     mahnoorTempIotRole:
       Type: AWS::IAM::Role
       Properties:
-        RoleName: mahnoor-temp-iot-role
+        RoleName: mahnoor-temp-iot-role-may9
         AssumeRolePolicyDocument:
           Version: "2012-10-17"
           Statement:
@@ -232,6 +258,50 @@ resources:
                 RoleArn: !GetAtt mahnoorTempIotRole.Arn
                 UseBase64: false
 
+    # ─────────────────────────────────────────
+    # MQTT.fx Monitoring — Thing, Policy, Certificate (Custom Resource)
+    # ─────────────────────────────────────────
+    mahnoorMqttFxThing:
+      Type: AWS::IoT::Thing
+      Properties:
+        ThingName: mahnoor-mqttfx-monitor
+        AttributePayload:
+          Attributes:
+            purpose: monitoring
+            tool: mqttfx
+
+    mahnoorMqttFxPolicy:
+      Type: AWS::IoT::Policy
+      Properties:
+        PolicyName: mahnoor-mqttfx-monitor-policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - iot:Connect
+                - iot:Subscribe
+                - iot:Receive
+                - iot:Publish
+              Resource:
+                - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/mahnoor-mqttfx-monitor"
+                - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/mahnoor-temp/*"
+                - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/mahnoor-temp/*"
+
+    # Custom::IoTCertificate invokes mahnoorMqttFxProvisioner Lambda during deploy.
+    # On CREATE: generates cert+key, attaches policy+thing, stores in SSM.
+    # On DELETE: detaches, deactivates, deletes cert, cleans SSM.
+    mahnoorMqttFxCertificate:
+      Type: Custom::IoTCertificate
+      DependsOn:
+        - mahnoorMqttFxThing
+        - mahnoorMqttFxPolicy
+      Properties:
+        ServiceToken: !GetAtt MahnoorMqttFxProvisionerLambdaFunction.Arn
+        ThingName: mahnoor-mqttfx-monitor
+        PolicyName: mahnoor-mqttfx-monitor-policy
+        Region: !Ref AWS::Region
+
   Outputs:
     IoTTopicName:
       Description: "Publish HVAC data to this IoT topic"
@@ -254,6 +324,14 @@ resources:
       Value:
         Fn::Sub: "https://${ApiGatewayRestApi}.execute-api.us-east-2.amazonaws.com/${self:provider.stage}"
 
+    MqttFxThingName:
+      Description: "IoT Thing name for MQTT.fx — use as Client ID"
+      Value: !Ref mahnoorMqttFxThing
+
+    MqttFxCertificateArn:
+      Description: "Fetch cert/key from SSM: /mahnoor/mqttfx/certificate-pem and /mahnoor/mqttfx/private-key"
+      Value: !GetAtt mahnoorMqttFxCertificate.CertificateArn
+
 plugins:
   - serverless-python-requirements
 
@@ -268,6 +346,7 @@ package:
     - 'ingest_hvac.py'
     - 'process_hvac.py'
     - 'dashboard_api.py'
+    - 'mqttfx_provisioner.py'
     - '!venv/**'
     - '!.venv/**'
     - '!node_modules/**'
